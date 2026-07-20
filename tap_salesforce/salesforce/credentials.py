@@ -10,11 +10,16 @@ LOGGER = logging.getLogger(__name__)
 
 OAuthCredentials = namedtuple("OAuthCredentials", ("client_id", "client_secret", "refresh_token"))
 
+ClientCredentials = namedtuple("ClientCredentials", ("client_id", "client_secret", "domain"))
+
 PasswordCredentials = namedtuple("PasswordCredentials", ("username", "password", "security_token"))
 
 
 def parse_credentials(config):
-    for cls in reversed((OAuthCredentials, PasswordCredentials)):
+    # Priority: refresh-token OAuth, then client-credentials, then username/password.
+    # OAuth is checked before ClientCredentials because both share client_id/client_secret;
+    # the presence of a refresh_token disambiguates in favor of the web-server flow.
+    for cls in (OAuthCredentials, ClientCredentials, PasswordCredentials):
         creds = cls(*(config.get(key) for key in cls._fields))
         if all(creds):
             return creds
@@ -53,6 +58,9 @@ class SalesforceAuth:
     def from_credentials(cls, credentials, **kwargs):
         if isinstance(credentials, OAuthCredentials):
             return SalesforceAuthOAuth(credentials, **kwargs)
+
+        if isinstance(credentials, ClientCredentials):
+            return SalesforceAuthClientCredentials(credentials, **kwargs)
 
         if isinstance(credentials, PasswordCredentials):
             return SalesforceAuthPassword(credentials, **kwargs)
@@ -102,6 +110,31 @@ class SalesforceAuthOAuth(SalesforceAuth):
             LOGGER.info("Starting new login timer")
             self.login_timer = threading.Timer(self.REFRESH_TOKEN_EXPIRATION_PERIOD, self.login)
             self.login_timer.start()
+
+
+class SalesforceAuthClientCredentials(SalesforceAuthOAuth):
+    """OAuth 2.0 client-credentials (server-to-server) flow.
+
+    Reuses SalesforceAuthOAuth.login(); only the grant type and the token
+    endpoint differ. Client credentials must be requested against the org's
+    My Domain host (e.g. https://mydomain.my.salesforce.com), not
+    login/test.salesforce.com.
+    """
+
+    @property
+    def _login_url(self):
+        domain = self._credentials.domain
+        if not domain.startswith("http"):
+            domain = "https://" + domain
+        return domain.rstrip("/") + "/services/oauth2/token"
+
+    @property
+    def _login_body(self):
+        return {
+            "grant_type": "client_credentials",
+            "client_id": self._credentials.client_id,
+            "client_secret": self._credentials.client_secret,
+        }
 
 
 class SalesforceAuthPassword(SalesforceAuth):
